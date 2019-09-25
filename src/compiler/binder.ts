@@ -132,6 +132,7 @@ namespace ts {
         let currentReturnTarget: FlowLabel | undefined;
         let currentTrueTarget: FlowLabel | undefined;
         let currentFalseTarget: FlowLabel | undefined;
+        let currentPostOptionalChainTarget: FlowLabel | undefined;
         let preSwitchCaseFlow: FlowNode | undefined;
         let activeLabels: ActiveLabel[] | undefined;
         let hasExplicitReturn: boolean;
@@ -200,6 +201,7 @@ namespace ts {
             currentReturnTarget = undefined;
             currentTrueTarget = undefined;
             currentFalseTarget = undefined;
+            currentPostOptionalChainTarget = undefined;
             activeLabels = undefined!;
             hasExplicitReturn = false;
             emitFlags = NodeFlags.None;
@@ -736,6 +738,12 @@ namespace ts {
                 case SyntaxKind.VariableDeclaration:
                     bindVariableDeclarationFlow(<VariableDeclaration>node);
                     break;
+                case SyntaxKind.PropertyAccessExpression:
+                    bindCallOrAccessExpressionFlow(<PropertyAccessExpression>node, bindRestOfPropertyAccessExpression);
+                    break;
+                case SyntaxKind.ElementAccessExpression:
+                    bindCallOrAccessExpressionFlow(<ElementAccessExpression>node, bindRestOfElementAccessExpression);
+                    break;
                 case SyntaxKind.CallExpression:
                     bindCallExpressionFlow(<CallExpression>node);
                     break;
@@ -883,6 +891,14 @@ namespace ts {
                 return unreachableFlow;
             }
             if (!isNarrowingExpression(expression)) {
+                return antecedent;
+            }
+            setFlowNodeReferenced(antecedent);
+            return flowNodeCreated({ flags, antecedent, node: expression });
+        }
+
+        function createFlowOptionalChain(flags: FlowFlags, antecedent: FlowNode, expression: OptionalChainRoot): FlowNode {
+            if (antecedent.flags & FlowFlags.Unreachable) {
                 return antecedent;
             }
             setFlowNodeReferenced(antecedent);
@@ -1481,28 +1497,88 @@ namespace ts {
             }
         }
 
-        function bindCallExpressionFlow(node: CallExpression) {
-            // If the target of the call expression is a function expression or arrow function we have
-            // an immediately invoked function expression (IIFE). Initialize the flowNode property to
-            // the current control flow (which includes evaluation of the IIFE arguments).
-            let expr: Expression = node.expression;
-            while (expr.kind === SyntaxKind.ParenthesizedExpression) {
-                expr = (<ParenthesizedExpression>expr).expression;
-            }
-            if (expr.kind === SyntaxKind.FunctionExpression || expr.kind === SyntaxKind.ArrowFunction) {
-                bindEach(node.typeArguments);
-                bindEach(node.arguments);
-                bind(node.expression);
-            }
-            else {
-                bindEachChild(node);
-            }
+        function bindPossibleFlowArrayMutation(node: CallExpression) {
             if (node.expression.kind === SyntaxKind.PropertyAccessExpression) {
                 const propertyAccess = <PropertyAccessExpression>node.expression;
                 if (isNarrowableOperand(propertyAccess.expression) && isPushOrUnshiftIdentifier(propertyAccess.name)) {
                     currentFlow = createFlowArrayMutation(currentFlow, node);
                 }
             }
+        }
+
+        function bindOptionalExpression(node: Node, postOptionalChainTarget: FlowLabel | undefined) {
+            if (currentPostOptionalChainTarget !== postOptionalChainTarget) {
+                const savedPostOptionalChainTarget = currentPostOptionalChainTarget;
+                currentPostOptionalChainTarget = postOptionalChainTarget;
+                bind(node);
+                currentPostOptionalChainTarget = savedPostOptionalChainTarget;
+            }
+            else {
+                bind(node);
+            }
+        }
+
+        function bindOptionalChain<T extends ValidOptionalChain>(node: T, bindRest: <U extends T>(node: U) => void) {
+            const postExpressionLabel = currentPostOptionalChainTarget || createBranchLabel();
+            if (isOptionalChainRoot(node)) {
+                // innermost node of optional chain
+                bindOptionalExpression(node.expression, /*postOptionalChainTarget*/ undefined);
+                const presentLabel = createBranchLabel();
+                addAntecedent(presentLabel, createFlowOptionalChain(FlowFlags.Present, currentFlow, node));
+                addAntecedent(postExpressionLabel, createFlowOptionalChain(FlowFlags.Missing, currentFlow, node));
+                currentFlow = finishFlowLabel(presentLabel);
+                bind(node.questionDotToken);
+            }
+            else {
+                bindOptionalExpression(node.expression, postExpressionLabel);
+            }
+            bindRest(node);
+            if (!currentPostOptionalChainTarget) {
+                // outermost node of optional chain
+                addAntecedent(postExpressionLabel, currentFlow);
+                currentFlow = finishFlowLabel(postExpressionLabel);
+            }
+        }
+
+        function bindCallOrAccessExpressionFlow<T extends CallExpression | PropertyAccessExpression | ElementAccessExpression>(node: T, bindRest: <U extends T>(node: U) => void) {
+            if (isValidOptionalChain(node)) {
+                bindOptionalChain(node, bindRest);
+            }
+            else {
+                bind(node.expression);
+                bindRest(node);
+            }
+        }
+
+        function bindRestOfPropertyAccessExpression(node: PropertyAccessExpression) {
+            bind(node.name);
+        }
+
+        function bindRestOfElementAccessExpression(node: ElementAccessExpression) {
+            bind(node.argumentExpression);
+        }
+
+        function bindRestOfCallExpression(node: CallExpression) {
+            bindEach(node.typeArguments);
+            bindEach(node.arguments);
+            bindPossibleFlowArrayMutation(node);
+        }
+
+        function bindCallExpressionFlow(node: CallExpression) {
+            if (!currentPostOptionalChainTarget) {
+                // If the target of the call expression is a function expression or arrow function we have
+                // an immediately invoked function expression (IIFE). Initialize the flowNode property to
+                // the current control flow (which includes evaluation of the IIFE arguments).
+                const expr = skipParentheses(node.expression);
+                if (expr.kind === SyntaxKind.FunctionExpression || expr.kind === SyntaxKind.ArrowFunction) {
+                    bindEach(node.typeArguments);
+                    bindEach(node.arguments);
+                    bind(node.expression);
+                    bindPossibleFlowArrayMutation(node);
+                    return;
+                }
+            }
+            bindCallOrAccessExpressionFlow(node, bindRestOfCallExpression);
         }
 
         function getContainerFlags(node: Node): ContainerFlags {
